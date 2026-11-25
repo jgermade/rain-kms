@@ -27,6 +27,6 @@ gantt
     Look and depth layers           :done, f1, 2026-11-25, 1d
     Band rendering and tuning       :done, f2, 2026-11-25, 1d
     section Deployment
-    Install and measure on display  :f3, after f2, 1d
-    Tune layers and size on screen  :f4, after f3, 1d
+    Install and measure on display  :done, f3, after f2, 1d
+    Tune layers and size on screen  :done, f4, after f3, 1d
 ```

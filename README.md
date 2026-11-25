@@ -19,20 +19,19 @@ Two styles:
 
 ## Footprint
 
-Measured on an Intel Alder Lake-N (UHD Graphics) mini PC, 1920×1080 @ 60 Hz, 30 FPS.
-The `rainbow` figures are from the kiosk service; the `film` ones from `--bench`
-(not yet measured as the service).
+Measured on an Intel Alder Lake-N (UHD Graphics) mini PC, 1920×1080 @ 60 Hz, 30 FPS,
+running as the kiosk service (`powersave` governor):
 
-| | `rainbow` | `film` (4 layers) |
+| | `rainbow` (v1) | `film` as installed¹ |
 |---|---|---|
 | Binary size | ~520 KB | (same binary) |
-| Process RSS | ~2.8 MB | ~3–4 MB expected (+ ~0.5 MB of glyph maps and a 490 KB band buffer) |
-| Peak at start-up | 22 MB (font loaded) | 22 MB (font loaded) |
+| Process RSS | ~2.8 MB | ~4.6 MB (1.9 MB in the service's cgroup) |
+| Peak at start-up | 22 MB (font loaded) | 23 MB (font loaded) |
 | Scan-out buffers | 2 × 8 MB (driver) | 2 × 8 MB (driver) |
-| Time per frame, full clock | ~0.9 ms | ~4.5 ms |
-| CPU, paced at 30 FPS | ~11–12.5 % of one core | ~30 % of one core |
+| Time per frame, full clock (`--bench`) | ~0.9 ms | ~2–2.4 ms (~4.5 ms with the defaults) |
+| CPU, measured on the service | ~12.5 % of one core | ~25–26 % of one core |
 
-For comparison, a browser kiosk (Firefox + cage) typically needs 300–500 MB.
+¹ `--layers 3 --max-size 40 --density 1 --speed-spread 4 --colors monokai`
 
 The paced CPU figures are inflated by frequency scaling: the work comes in short
 bursts (one frame, then sleep), so with the `powersave` governor the CPU stays at
