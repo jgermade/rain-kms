@@ -1,8 +1,8 @@
 [package]
 name = "rain-kms"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Full-screen katakana rain drawn straight to the display with DRM/KMS (no compositor, no browser)"
+description = "Full-screen digital rain (film style with depth, or rainbow katakana) drawn straight to the display with DRM/KMS (no compositor, no browser)"
 repository = "https://github.com/jgermade/rain-kms"
 
 [dependencies]

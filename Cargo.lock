@@ -147,7 +147,7 @@ dependencies = [
 
 [[package]]
 name = "rain-kms"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "drm",
