@@ -23,6 +23,12 @@ ExecStart=/usr/local/bin/rain-kms --res 1920x1080 --size 30 --fps 30
 Restart=always
 RestartSec=3
 
+# Low priority: the rain is decorative, so under load it gives way to other
+# services (it may drop a few frames while the machine is busy)
+Nice=10
+CPUWeight=20
+IOSchedulingClass=idle
+
 # Sandboxing: it only needs the graphics card and the font
 NoNewPrivileges=yes
 ProtectSystem=strict

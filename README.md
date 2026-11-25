@@ -94,7 +94,9 @@ sudo ./install.sh
 This creates a `kiosk` system user, installs the binary to `/usr/local/bin`, and
 enables `rain-kms.service`, which replaces the text console on `tty1`. The service
 is sandboxed (no network, no home directories, 64 MB memory limit) and restarts
-on failure.
+on failure. It runs at low priority (`Nice=10`, `CPUWeight=20`, idle I/O class):
+the rain is decorative, so under load it gives way to other services and may drop
+a few frames.
 
 To remove it:
 
