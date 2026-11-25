@@ -1,0 +1,39 @@
+[Unit]
+Description=rain-kms: full-screen katakana rain kiosk (DRM/KMS)
+Documentation=https://github.com/jgermade/rain-kms
+After=systemd-user-sessions.service plymouth-quit-wait.service
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+User=kiosk
+Group=kiosk
+SupplementaryGroups=video
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardInput=tty-fail
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+ExecStart=/usr/local/bin/rain-kms --res 1920x1080 --size 30 --fps 30
+Restart=always
+RestartSec=3
+
+# Sandboxing: it only needs the graphics card and the font
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
