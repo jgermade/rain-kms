@@ -11,7 +11,8 @@ install -m 755 "$HERE/target/release/rain-kms" /usr/local/bin/rain-kms
 install -m 644 "$HERE/rain-kms.service" /etc/systemd/system/rain-kms.service
 systemctl daemon-reload
 systemctl disable --now getty@tty1.service 2>/dev/null || true
-systemctl enable --now rain-kms.service
+systemctl enable rain-kms.service
+systemctl restart rain-kms.service # picks up a new binary when reinstalling
 sleep 3
 systemctl --no-pager --lines=5 status rain-kms.service || true
 echo

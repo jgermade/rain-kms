@@ -9,11 +9,12 @@
 //! as the glyphs are ready.
 //!
 //! Usage: rain-kms [--res 1920x1080|native] [--size 30] [--fps 30]
-//!                 [--card auto|/dev/dri/cardN] [--font PATH.ttc] [--font-index 0]
-//!                 [--capture FILE.ppm]
+//!                 [--card auto|/dev/dri/cardN] [--background 000000]
+//!                 [--font PATH.ttc] [--font-index 0] [--capture FILE.ppm]
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::{AsFd, BorrowedFd};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
@@ -21,7 +22,12 @@ use drm::buffer::Buffer as _;
 use drm::control::{connector, crtc, dumbbuffer::DumbBuffer, framebuffer, Device as ControlDevice, Event, Mode, PageFlipFlags};
 use drm::Device;
 
-const BACKGROUND: u32 = 0x0006_0910; // #060910
+/// Background colour (0xRRGGBB), set once at start-up from `--background`.
+static BACKGROUND: AtomicU32 = AtomicU32::new(0x00_0000);
+
+fn background() -> u32 {
+    BACKGROUND.load(Ordering::Relaxed)
+}
 const FIRST_KANA: u32 = 0x30A0;
 const KANA_COUNT: usize = 96;
 
@@ -48,10 +54,11 @@ struct Options {
     font: String,
     font_index: u32,
     capture: Option<String>,
+    bench: bool,
 }
 
 const USAGE: &str = "rain-kms [--res 1920x1080|native] [--size 30] [--fps 30] [--card auto|/dev/dri/cardN] \
-[--font PATH] [--font-index 0] [--capture FILE.ppm]";
+[--background 000000] [--font PATH] [--font-index 0] [--capture FILE.ppm] [--bench]";
 
 fn options() -> Options {
     let mut o = Options {
@@ -62,6 +69,7 @@ fn options() -> Options {
         font: "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc".into(),
         font_index: 0, // 0 = Noto Sans CJK JP inside the .ttc collection
         capture: None,
+        bench: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -83,6 +91,17 @@ fn options() -> Options {
             "--font-index" => o.font_index = value().parse().unwrap_or_else(|_| fail("invalid --font-index")),
             // render one frame (after 3 simulated seconds) to a PPM file and exit, without touching the display
             "--capture" => o.capture = Some(value()),
+            // render frames into RAM and report the time per frame, without touching the display
+            "--bench" => o.bench = true,
+            "--background" => {
+                let v = value();
+                let hex = v.trim_start_matches('#');
+                let rgb = u32::from_str_radix(hex, 16)
+                    .ok()
+                    .filter(|_| hex.len() == 6)
+                    .unwrap_or_else(|| fail("--background must be a RRGGBB hex colour, e.g. 000000"));
+                BACKGROUND.store(rgb, Ordering::Relaxed);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -101,11 +120,9 @@ fn fail(msg: &str) -> ! {
 // ---------------------------------------------------------------------------
 // Glyphs: the 96 katakana rendered once, as coverage maps (0-255)
 
+/// A glyph as a coverage map (0-255) exactly one cell (size × size) in size,
+/// already positioned inside the cell.
 struct Glyph {
-    dx: i32, // offset inside the cell
-    dy: i32,
-    width: usize,
-    height: usize,
     coverage: Vec<u8>,
 }
 
@@ -122,21 +139,20 @@ fn render_glyphs(path: &str, index: u32, size: u32) -> Vec<Glyph> {
             let id = font.glyph_id(c);
             let advance = scaled.h_advance(id);
             let glyph = id.with_scale_and_position(scale, ab_glyph::point((size as f32 - advance) / 2.0, baseline));
-            match font.outline_glyph(glyph) {
-                Some(outline) => {
-                    let b = outline.px_bounds();
-                    let (width, height) = (b.width() as usize, b.height() as usize);
-                    let mut coverage = vec![0u8; width * height];
-                    outline.draw(|x, y, c| {
-                        let i = y as usize * width + x as usize;
-                        if i < coverage.len() {
-                            coverage[i] = (c.clamp(0.0, 1.0) * 255.0) as u8;
-                        }
-                    });
-                    Glyph { dx: b.min.x as i32, dy: b.min.y as i32, width, height, coverage }
-                }
-                None => Glyph { dx: 0, dy: 0, width: 0, height: 0, coverage: Vec::new() },
+            let cell = size as usize;
+            let mut coverage = vec![0u8; cell * cell];
+            if let Some(outline) = font.outline_glyph(glyph) {
+                let b = outline.px_bounds();
+                let (dx, dy) = (b.min.x as i32, b.min.y as i32);
+                // anything spilling out of the cell is clipped
+                outline.draw(|x, y, c| {
+                    let (cx, cy) = (dx + x as i32, dy + y as i32);
+                    if (0..cell as i32).contains(&cx) && (0..cell as i32).contains(&cy) {
+                        coverage[cy as usize * cell + cx as usize] = (c.clamp(0.0, 1.0) * 255.0) as u8;
+                    }
+                });
             }
+            Glyph { coverage }
         })
         .collect();
     drop(data); // frees the ~20 MB font file
@@ -204,44 +220,47 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     ((r + m) * 255.0, (g + m) * 255.0, (b + m) * 255.0)
 }
 
-/// Paints a glyph over the background. It blends against the known background colour
-/// instead of reading the buffer back: video memory is very slow to read.
-#[allow(clippy::too_many_arguments)]
-fn paint(px: &mut [u32], width: usize, height: usize, stride: usize, g: &Glyph, x0: i32, y0: i32, color: (f32, f32, f32), alpha: f32) {
-    let (br, bg, bb) = (((BACKGROUND >> 16) & 0xff) as f32, ((BACKGROUND >> 8) & 0xff) as f32, (BACKGROUND & 0xff) as f32);
-    let (dr, dg, db) = (color.0 - br, color.1 - bg, color.2 - bb);
-    let alpha = alpha / 255.0;
-    for gy in 0..g.height {
-        let y = y0 + g.dy + gy as i32;
-        if y < 0 || y as usize >= height {
-            continue;
-        }
-        let row = &mut px[y as usize * stride..];
-        for gx in 0..g.width {
-            let c = g.coverage[gy * g.width + gx];
-            if c == 0 {
-                continue;
-            }
-            let x = x0 + g.dx + gx as i32;
-            if x < 0 || x as usize >= width {
-                continue;
-            }
-            let a = c as f32 * alpha;
-            let r = (br + dr * a) as u32;
-            let gr = (bg + dg * a) as u32;
-            let b = (bb + db * a) as u32;
-            row[x as usize] = (r << 16) | (gr << 8) | b;
-        }
+/// Colour for every coverage level (0-255) of a glyph drawn in `color` at `alpha`
+/// over the background, in integer maths. Drawing a cell is then one table lookup
+/// per pixel. Blending against the known background colour means video memory is
+/// never read back.
+fn blend_table(bg: u32, color: (u32, u32, u32), alpha: f32) -> [u32; 256] {
+    let (br, bgg, bb) = ((bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff);
+    let alpha = (alpha.clamp(0.0, 1.0) * 256.0) as u32; // 0..=256
+    let mut table = [0u32; 256];
+    for (c, out) in table.iter_mut().enumerate() {
+        let a = (c as u32 * alpha + 128) >> 8; // 0..=256
+        let mix = |b: u32, f: u32| (b * (256 - a) + f * a) >> 8;
+        *out = (mix(br, color.0) << 16) | (mix(bgg, color.1) << 8) | mix(bb, color.2);
     }
+    table
 }
+
+/// Hue is rounded to steps of this many degrees, so a lit cell only needs redrawing
+/// every few frames instead of on every frame as the rainbow drifts.
+const HUE_STEP: f32 = 6.0;
+/// Brightness levels a cell can take.
+const ALPHA_LEVELS: f32 = 63.0;
 
 struct Rain {
     drops: Vec<RainDrop>,
     rng: Rng,
     size: i32,
     rows: i32,
-    width: usize,
     height: usize,
+    /// rows of cells that can be visible: cell `r` covers pixel rows [(r-1)*size, r*size)
+    visible_rows: usize,
+}
+
+/// What a cell shows, packed in a u32 so frames can be compared cheaply.
+/// 0 = empty; otherwise lit | head | char | alpha level | hue step.
+fn cell_key(head: bool, kana: u8, alpha: f32, hue: f32) -> u32 {
+    let a = (alpha.clamp(0.0, 1.0) * ALPHA_LEVELS).round() as u32;
+    if a == 0 {
+        return 0;
+    }
+    let h = if head { 0 } else { ((hue / HUE_STEP) as u32) % (360.0 / HUE_STEP) as u32 };
+    (1 << 31) | ((head as u32) << 30) | ((kana as u32) << 16) | (a << 8) | h
 }
 
 impl Rain {
@@ -257,13 +276,32 @@ impl Rain {
                 d
             })
             .collect();
-        Rain { drops, rng, size, rows, width, height }
+        let visible_rows = height.div_ceil(size as usize) + 1;
+        Rain { drops, rng, size, rows, height, visible_rows }
     }
 
-    /// Advances `dt` seconds and draws a full frame into `px` (stride = pixels per row).
-    fn frame(&mut self, px: &mut [u32], stride: usize, glyphs: &[Glyph], dt: f32, ms: f32) {
-        let (size, rows, width, height) = (self.size, self.rows, self.width, self.height);
-        px.fill(BACKGROUND);
+    /// Number of cells; each buffer keeps one key per cell (see `frame`).
+    fn cells(&self) -> usize {
+        self.drops.len() * self.visible_rows
+    }
+
+    /// Advances `dt` seconds and updates the frame in `px` (stride = pixels per row).
+    ///
+    /// Glyphs never move: each one sits in a fixed cell of the grid, and only whether
+    /// it is lit, its brightness, its hue and (now and then) its character change.
+    /// `keys` holds what each cell of this buffer currently shows; only cells whose
+    /// key differs are redrawn. `px` must start out filled with the background colour
+    /// and `keys` with zeros.
+    ///
+    /// `px` is usually a scan-out buffer in write-combined memory: fast for sequential
+    /// writes, very slow for scattered single-pixel ones. So each changed cell is
+    /// composed in a small tile in ordinary RAM and copied to `px` row by row.
+    #[allow(clippy::too_many_arguments)]
+    fn frame(&mut self, px: &mut [u32], stride: usize, glyphs: &[Glyph], dt: f32, ms: f32, keys: &mut [u32]) -> usize {
+        let (size, rows, height, vis) = (self.size, self.rows, self.height, self.visible_rows);
+        let bg = background();
+        let cell = size as usize;
+        let mut redrawn = 0;
         for (x, d) in self.drops.iter_mut().enumerate() {
             if self.rng.f() > 0.4 {
                 let i = (self.rng.next() % rows as u64) as usize;
@@ -271,42 +309,185 @@ impl Rain {
             }
             d.y += d.speed * dt * 12.0;
             let head = d.y.floor() as i32;
-            let hue = (ms / 15.0 + x as f32 * 10.0) % 360.0;
-            let tail_color = hsl_to_rgb(hue, 0.8, 0.65);
+            let hue = (ms / 15.0 + x as f32 * 10.0).rem_euclid(360.0);
 
-            for i in 0..d.length {
-                let row = head - i;
-                if row < 0 || row >= rows {
+            for r in 1..vis {
+                let i = head - r as i32; // distance from the head; 0 = head
+                let key = if (0..d.length).contains(&i) && (r as i32) < rows {
+                    let alpha = if i == 0 { d.brightness } else { d.brightness * (1.0 - i as f32 / d.length as f32) };
+                    cell_key(i == 0, d.chars[r], alpha, hue)
+                } else {
+                    0
+                };
+                let slot = &mut keys[x * vis + r];
+                if *slot == key {
                     continue;
                 }
-                let (color, alpha) = if i == 0 {
-                    ((220.0, 255.0, 255.0), d.brightness)
+                *slot = key;
+                redrawn += 1;
+
+                // draw the cell from its key alone, so equal keys give equal pixels; its top
+                // is (r-1)*size (the row marks the baseline, as in the original demo)
+                let top = (r as i32 - 1) * size;
+                let table = if key != 0 {
+                    let alpha = ((key >> 8) & 0xff) as f32 / ALPHA_LEVELS;
+                    let color = if key & (1 << 30) != 0 {
+                        (220, 255, 255)
+                    } else {
+                        let (r, g, b) = hsl_to_rgb((key & 0xff) as f32 * HUE_STEP, 0.8, 0.65);
+                        (r as u32, g as u32, b as u32)
+                    };
+                    Some((blend_table(bg, color, alpha), &glyphs[((key >> 16) & 0x7f) as usize].coverage))
                 } else {
-                    (tail_color, d.brightness * (1.0 - i as f32 / d.length as f32))
+                    None
                 };
-                let glyph = &glyphs[d.chars[row as usize] as usize];
-                // as in the original demo: the row marks the text baseline
-                paint(px, width, height, stride, glyph, x as i32 * size, (row - 1) * size, color, alpha);
+                for ty in 0..cell {
+                    let y = top + ty as i32;
+                    if y < 0 || y as usize >= height {
+                        continue;
+                    }
+                    let start = y as usize * stride + x * cell;
+                    let dst = &mut px[start..start + cell];
+                    match &table {
+                        // written straight into the buffer, one sequential row at a time
+                        Some((t, cov)) => {
+                            for (p, &c) in dst.iter_mut().zip(&cov[ty * cell..(ty + 1) * cell]) {
+                                *p = t[c as usize];
+                            }
+                        }
+                        None => dst.fill(bg),
+                    }
+                }
             }
             if ((d.y - d.length as f32) * size as f32) > height as f32 {
                 d.reset(&mut self.rng, rows, false);
             }
         }
+        redrawn
     }
+}
+
+/// Benchmark mode: renders frames and reports the cost per frame, first into ordinary
+/// RAM and then into real scan-out buffers of the graphics card (created and mapped
+/// but never shown, so it works while another program owns the display).
+fn bench(res: Option<(u16, u16)>, size: i32, glyphs: &[Glyph], card: &str) {
+    let (w, h) = res.unwrap_or((1920, 1080));
+    let (width, height) = (w as usize, h as usize);
+
+    let run = |label: &str, a: &mut [u32], b: &mut [u32], stride: usize| {
+        let mut rain = Rain::new(size, width, height);
+        let mut keys = [vec![0u32; rain.cells()], vec![0u32; rain.cells()]];
+        let frames = 300;
+        let mut redrawn = 0;
+        let t = Instant::now();
+        for f in 0..frames {
+            let px: &mut [u32] = if f % 2 == 0 { &mut *a } else { &mut *b };
+            redrawn += rain.frame(px, stride, glyphs, 1.0 / 30.0, f as f32 * 1000.0 / 30.0, &mut keys[f % 2]);
+        }
+        let per_frame = t.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+        println!(
+            "{label}: {per_frame:.2} ms per frame -> {:.1} % of one core at 30 FPS; {} of {} cells redrawn per frame",
+            per_frame * 30.0 / 10.0,
+            redrawn / frames,
+            rain.cells()
+        );
+    };
+    let fill_speed = |label: &str, px: &mut [u32]| {
+        let t = Instant::now();
+        for i in 0..10 {
+            px.fill(i);
+        }
+        let secs = t.elapsed().as_secs_f64();
+        println!("{label}: sequential fill {:.0} MB/s", (px.len() * 4 * 10) as f64 / secs / 1e6);
+        px.fill(background());
+    };
+
+    println!("{w}x{h}, {size} px glyphs");
+    let mut ram = [vec![background(); width * height], vec![background(); width * height]];
+    let [ra, rb] = &mut ram;
+    fill_speed("RAM", ra);
+    run("RAM", ra, rb, width);
+
+    // the same into the card's scan-out buffers
+    let c = open_card(card);
+    let mut dumbs: Vec<DumbBuffer> = (0..2)
+        .map(|_| {
+            c.create_dumb_buffer((w as u32, h as u32), drm_fourcc::DrmFourcc::Xrgb8888, 32)
+                .unwrap_or_else(|e| fail(&format!("cannot create buffer: {e}")))
+        })
+        .collect();
+    let stride = dumbs[0].pitch() as usize / 4;
+    let mut maps: Vec<_> = dumbs
+        .iter_mut()
+        .map(|db| c.map_dumb_buffer(db).unwrap_or_else(|e| fail(&format!("cannot map buffer: {e}"))))
+        .collect();
+    let mut slices: Vec<&mut [u32]> = maps
+        .iter_mut()
+        .map(|m| {
+            let bytes = m.as_mut();
+            // SAFETY: page-aligned mapping of stride*height*4 bytes, alive for this function
+            unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, bytes.len() / 4) }
+        })
+        .collect();
+    let (sa, sb) = slices.split_at_mut(1);
+    fill_speed("scan-out buffer", sa[0]);
+    sb[0].fill(background());
+    run("scan-out buffer", sa[0], sb[0], stride);
+
+    // Paced like the real loop (one frame, then sleep until the next one) and measured
+    // as CPU time, which is what tools like top report. Short bursts of work let the
+    // CPU stay at a low clock, so this can differ a lot from the figures above.
+    let mut rain = Rain::new(size, width, height);
+    let mut keys = [vec![0u32; rain.cells()], vec![0u32; rain.cells()]];
+    let period = Duration::from_secs_f64(1.0 / 30.0);
+    let frames = 150;
+    let (cpu0, t0) = (cpu_time(), Instant::now());
+    let mut busy = Duration::ZERO;
+    for f in 0..frames {
+        let start = Instant::now();
+        let px: &mut [u32] = if f % 2 == 0 { &mut *sa[0] } else { &mut *sb[0] };
+        rain.frame(px, stride, glyphs, 1.0 / 30.0, f as f32 * 1000.0 / 30.0, &mut keys[f % 2]);
+        let spent = start.elapsed();
+        busy += spent;
+        if spent < period {
+            std::thread::sleep(period - spent);
+        }
+    }
+    let wall = t0.elapsed().as_secs_f64();
+    println!(
+        "paced at 30 FPS: {:.2} ms per frame, {:.1} % CPU time",
+        busy.as_secs_f64() * 1000.0 / frames as f64,
+        (cpu_time() - cpu0) * 100.0 / wall
+    );
+}
+
+/// CPU time (user + system) used by this process so far, in seconds.
+fn cpu_time() -> f64 {
+    let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+    // fields after the command name, which is in parentheses and may contain spaces
+    let rest = stat.rsplit(')').next().unwrap_or("");
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let ticks = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    (ticks(11) + ticks(12)) / 100.0 // utime, stime; USER_HZ is 100 on Linux
 }
 
 /// Test mode: simulates 3 s and saves the frame as a PPM image.
 fn capture(path: &str, res: Option<(u16, u16)>, size: i32, glyphs: &[Glyph]) {
     let (w, h) = res.unwrap_or((1920, 1080));
     let (width, height) = (w as usize, h as usize);
-    let mut px = vec![0u32; width * height];
     let mut rain = Rain::new(size, width, height);
-    for f in 0..90 {
-        rain.frame(&mut px, width, glyphs, 1.0 / 30.0, f as f32 * 1000.0 / 30.0);
+    // two buffers, alternated, as on the real display; the last one drawn is saved
+    let mut bufs = [vec![background(); width * height], vec![background(); width * height]];
+    let mut keys = [vec![0u32; rain.cells()], vec![0u32; rain.cells()]];
+    let frames = 90;
+    for f in 0..frames {
+        let b = f % 2;
+        rain.frame(&mut bufs[b], width, glyphs, 1.0 / 30.0, f as f32 * 1000.0 / 30.0, &mut keys[b]);
     }
+    let px = &bufs[(frames - 1) % 2];
     let mut out = format!("P6\n{width} {height}\n255\n").into_bytes();
     out.reserve(width * height * 3);
-    for p in &px {
+    for p in px.iter() {
         out.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
     }
     std::fs::write(path, out).unwrap_or_else(|e| fail(&format!("cannot write {path}: {e}")));
@@ -377,9 +558,13 @@ fn open_card(card: &str) -> Card {
     fail("no graphics card with a connected display found");
 }
 
-struct Buffer {
-    db: DumbBuffer,
+/// One scan-out buffer, mapped once for the whole run (re-mapping every frame costs
+/// thousands of page faults), plus the rectangles last painted into it.
+struct Buffer<'a> {
     fb: framebuffer::Handle,
+    px: &'a mut [u32],
+    stride: usize,
+    keys: Vec<u32>,
 }
 
 fn main() {
@@ -389,6 +574,10 @@ fn main() {
         capture(path, o.res, o.size as i32, &glyphs);
         return;
     }
+    if o.bench {
+        bench(o.res, o.size as i32, &glyphs, &o.card);
+        return;
+    }
 
     let card = open_card(&o.card);
     let (con, crtc, mode) = pick_output(&card, o.res);
@@ -396,17 +585,35 @@ fn main() {
     let (width, height) = (w as usize, h as usize);
     eprintln!("rain-kms: {}x{} at {} Hz, {} px glyphs, {} FPS", w, h, mode.vrefresh(), o.size, o.fps);
 
-    let mut buffers: Vec<Buffer> = (0..2)
+    let mut rain = Rain::new(o.size as i32, width, height);
+
+    let mut dumbs: Vec<DumbBuffer> = (0..2)
         .map(|_| {
-            let db = card
-                .create_dumb_buffer((w as u32, h as u32), drm_fourcc::DrmFourcc::Xrgb8888, 32)
-                .unwrap_or_else(|e| fail(&format!("cannot create buffer: {e}")));
-            let fb = card.add_framebuffer(&db, 24, 32).unwrap_or_else(|e| fail(&format!("cannot create framebuffer: {e}")));
-            Buffer { db, fb }
+            card.create_dumb_buffer((w as u32, h as u32), drm_fourcc::DrmFourcc::Xrgb8888, 32)
+                .unwrap_or_else(|e| fail(&format!("cannot create buffer: {e}")))
         })
         .collect();
-
-    let mut rain = Rain::new(o.size as i32, width, height);
+    let fbs: Vec<framebuffer::Handle> = dumbs
+        .iter()
+        .map(|db| card.add_framebuffer(db, 24, 32).unwrap_or_else(|e| fail(&format!("cannot create framebuffer: {e}"))))
+        .collect();
+    let strides: Vec<usize> = dumbs.iter().map(|db| db.pitch() as usize / 4).collect();
+    let mut maps: Vec<_> = dumbs
+        .iter_mut()
+        .map(|db| card.map_dumb_buffer(db).unwrap_or_else(|e| fail(&format!("cannot map buffer: {e}"))))
+        .collect();
+    let mut buffers: Vec<Buffer> = maps
+        .iter_mut()
+        .zip(fbs.iter().zip(&strides))
+        .map(|(map, (&fb, &stride))| {
+            let bytes = map.as_mut();
+            // SAFETY: the mapping is page-aligned, stride*height*4 bytes long, and lives
+            // (in `maps`) for as long as this slice is used.
+            let px: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, bytes.len() / 4) };
+            px.fill(background()); // full clear once; afterwards only changed cells
+            Buffer { fb, px, stride, keys: vec![0; rain.cells()] }
+        })
+        .collect();
 
     let start = Instant::now();
     let period = Duration::from_secs_f64(1.0 / o.fps as f64);
@@ -422,14 +629,7 @@ fn main() {
 
         // draw into the buffer that is not on screen
         let b = &mut buffers[current];
-        let stride = b.db.pitch() as usize / 4;
-        {
-            let mut map = card.map_dumb_buffer(&mut b.db).unwrap_or_else(|e| fail(&format!("cannot map buffer: {e}")));
-            let bytes = map.as_mut();
-            // SAFETY: the buffer is page-aligned and is stride*height*4 bytes long
-            let px: &mut [u32] = unsafe { std::slice::from_raw_parts_mut(bytes.as_mut_ptr() as *mut u32, bytes.len() / 4) };
-            rain.frame(px, stride, &glyphs, dt, ms);
-        }
+        rain.frame(b.px, b.stride, &glyphs, dt, ms, &mut b.keys);
 
         // show it
         if first {
